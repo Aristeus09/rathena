@@ -81,6 +81,7 @@ struct s_mob_skill_db {
 std::unordered_map<int32, std::shared_ptr<s_mob_skill_db>> mob_skill_db; /// Monster skill temporary db. s_mob_skill_db -> mobid
 
 std::unordered_map<uint32, std::shared_ptr<s_item_drop_list>> mob_delayed_drops;
+std::unordered_map<uint32, std::shared_ptr<s_item_drop_list>> mob_looted_drops;
 MobSummonDatabase mob_summon_db;
 MobChatDatabase mob_chat_db;
 MapDropDatabase map_drop_db;
@@ -190,6 +191,7 @@ void mvptomb_create(struct mob_data *md, char *killer, time_t time)
 		mvptomb_destroy(md);
 
 	CREATE(nd, struct npc_data, 1);
+	new (nd) npc_data();
 
 	nd->bl.id = md->tomb_nid = npc_get_new_npc_id();
 
@@ -202,12 +204,16 @@ void mvptomb_create(struct mob_data *md, char *killer, time_t time)
 	safestrncpy(nd->name, msg_txt(nullptr,656), sizeof(nd->name));
 
 	nd->class_ = 565;
-	nd->speed = 200;
+	nd->speed = DEFAULT_NPC_WALK_SPEED;
 	nd->subtype = NPCTYPE_TOMB;
 
 	nd->u.tomb.md = md;
 	nd->u.tomb.kill_time = time;
 	nd->u.tomb.spawn_timer = INVALID_TIMER;
+
+	nd->dynamicnpc.owner_char_id = 0;
+	nd->dynamicnpc.last_interaction = 0;
+	nd->dynamicnpc.removal_tid = INVALID_TIMER;
 
 	if (killer)
 		safestrncpy(nd->u.tomb.killer_name, killer, NAME_LENGTH);
@@ -371,8 +377,10 @@ e_mob_bosstype s_mob_db::get_bosstype(){
 }
 
 e_mob_bosstype mob_data::get_bosstype(){
-	if( this->db != nullptr ){
-		return this->db->get_bosstype();
+	if( status_has_mode( &this->status, MD_MVP ) ){
+		return BOSSTYPE_MVP;
+	}else if( this->status.class_ == CLASS_BOSS ){
+		return BOSSTYPE_MINIBOSS;
 	}else{
 		return BOSSTYPE_NONE;
 	}
@@ -1435,7 +1443,7 @@ static int mob_ai_sub_hard_slavemob(struct mob_data *md,t_tick tick)
 
 	bl=map_id2bl(md->master_id);
 
-	if (!bl || status_isdead(bl)) {
+	if (!bl || status_isdead(*bl)) {
 		status_kill(&md->bl);
 		return 1;
 	}
@@ -1558,7 +1566,7 @@ int mob_unlocktarget(struct mob_data *md, t_tick tick)
 		break;
 	default:
 		mob_stop_attack(md);
-		mob_stop_walking(md,1); //Stop chasing.
+		unit_stop_walking_soon(md->bl); //Stop chasing.
 		if (status_has_mode(&md->status,MD_ANGRY) && !md->state.aggressive)
 			md->state.aggressive = 1; //Restore angry state when switching to idle
 		md->state.skillstate = MSS_IDLE;
@@ -1900,6 +1908,8 @@ static bool mob_ai_sub_hard(struct mob_data *md, t_tick tick)
 			md->state.skillstate = MSS_LOOT;
 			if (!unit_walktobl(&md->bl, tbl, 0, 0))
 				mob_unlocktarget(md, tick); //Can't loot...
+			else
+				unit_set_target(&md->ud, tbl->id); //Remember current loot target
 			return true;
 		}
 		//Within looting range.
@@ -1924,7 +1934,7 @@ static bool mob_ai_sub_hard(struct mob_data *md, t_tick tick)
 
 		if (pcdb_checkid(md->vd->class_))
 		{	//Give them walk act/delay to properly mimic players. [Skotlex]
-			clif_takeitem(&md->bl,tbl);
+			clif_takeitem(md->bl,*tbl);
 			md->ud.canact_tick = tick + md->status.amotion;
 			unit_set_walkdelay(&md->bl, tick, md->status.amotion, 1);
 		}
@@ -2216,24 +2226,52 @@ static std::shared_ptr<s_item_drop> mob_setlootitem( s_mob_lootitem& item, unsig
 	return drop;
 }
 
+/**
+ * Makes all items from a drop list drop
+ * @param list: list with all items that should drop
+ * @param loot: whether the items in the list are new drops or previously looted items
+ */
+void mob_process_drop_list(std::shared_ptr<s_item_drop_list>& list, bool loot)
+{
+	// First regular drop always drops at center
+	enum directions dir = DIR_CENTER;
+	// Looted drops start north instead
+	if (loot)
+		dir = DIR_NORTH;
+
+	for (std::shared_ptr<s_item_drop>& ditem : list->items) {
+		map_addflooritem(&ditem->item_data, ditem->item_data.amount,
+			list->m, list->x, list->y,
+			list->first_charid, list->second_charid, list->third_charid, 4, ditem->mob_id, !loot, dir, BL_CHAR|BL_PET);
+		// The drop location loops between three locations: SE -> W -> N -> SE
+		if (dir <= DIR_NORTH)
+			dir = DIR_SOUTHEAST;
+		else if (dir == DIR_SOUTHEAST)
+			dir = DIR_WEST;
+		else
+			dir = DIR_NORTH;
+	}
+}
+
 /*==========================================
  * item drop with delay (timer function)
  *------------------------------------------*/
-static TIMER_FUNC(mob_delay_item_drop){
-	uint32 bl_id = static_cast<uint32>( id );
-	std::shared_ptr<s_item_drop_list> list = util::umap_find( mob_delayed_drops, bl_id );
+static TIMER_FUNC(mob_delay_item_drop) {
+	uint32 bl_id = static_cast<uint32>(id);
 
-	if( list == nullptr ){
-		return 0;
+	// Regular drops
+	std::shared_ptr<s_item_drop_list> list = util::umap_find(mob_delayed_drops, bl_id);
+	if (list != nullptr) {
+		mob_process_drop_list(list, false);
+		mob_delayed_drops.erase(bl_id);
 	}
 
-	for( std::shared_ptr<s_item_drop>& ditem : list->items ){
-		map_addflooritem(&ditem->item_data,ditem->item_data.amount,
-			list->m,list->x,list->y,
-			list->first_charid,list->second_charid,list->third_charid,4,ditem->mob_id,true);
+	// Looted drops
+	list = util::umap_find(mob_looted_drops, bl_id);
+	if (list != nullptr) {
+		mob_process_drop_list(list, true);
+		mob_looted_drops.erase(bl_id);
 	}
-
-	mob_delayed_drops.erase( bl_id );
 
 	return 0;
 }
@@ -2833,6 +2871,24 @@ int mob_dead(struct mob_data *md, struct block_list *src, int type)
 
 	} //End EXP giving.
 
+	// Looted items have an independent drop position and also don't show special effects when dropped
+	// So we need put them into a separate list
+	std::shared_ptr<s_item_drop_list> lootlist = std::make_shared<s_item_drop_list>();
+	lootlist->m = md->bl.m;
+	lootlist->x = md->bl.x;
+	lootlist->y = md->bl.y;
+	lootlist->first_charid = (mvp_sd ? mvp_sd->status.char_id : 0);
+	lootlist->second_charid = (second_sd ? second_sd->status.char_id : 0);
+	lootlist->third_charid = (third_sd ? third_sd->status.char_id : 0);
+
+	// Process items looted by the mob
+	if (md->lootitems) {
+		for (i = 0; i < md->lootitem_count; i++) {
+			std::shared_ptr<s_item_drop> ditem = mob_setlootitem(md->lootitems[i], md->mob_id);
+			mob_item_drop(md, lootlist, ditem, 1, 10000, homkillonly || merckillonly);
+		}
+	}
+
 	if( !(type&1) && !map_getmapflag(m, MF_NOMOBLOOT) && !md->state.rebirth && (
 		!md->special_state.ai || //Non special mob
 		battle_config.alchemist_summon_reward == 2 || //All summoned give drops
@@ -2846,47 +2902,12 @@ int mob_dead(struct mob_data *md, struct block_list *src, int type)
 #endif
 
 		std::shared_ptr<s_item_drop_list> dlist = std::make_shared<s_item_drop_list>();
-
 		dlist->m = md->bl.m;
 		dlist->x = md->bl.x;
 		dlist->y = md->bl.y;
 		dlist->first_charid = (mvp_sd ? mvp_sd->status.char_id : 0);
 		dlist->second_charid = (second_sd ? second_sd->status.char_id : 0);
 		dlist->third_charid = (third_sd ? third_sd->status.char_id : 0);
-
-		for (i = 0; i < MAX_MOB_DROP_TOTAL; i++) {
-			if (md->db->dropitem[i].nameid == 0)
-				continue;
-
-			std::shared_ptr<item_data> it = item_db.find(md->db->dropitem[i].nameid);
-
-			if ( it == nullptr )
-				continue;
-			
-			drop_rate = mob_getdroprate(src, md->db, md->db->dropitem[i].rate, drop_modifier, md);
-
-			// attempt to drop the item
-			if (rnd() % 10000 >= drop_rate)
-				continue;
-
-			if( mvp_sd && it->type == IT_PETEGG ) {
-				pet_create_egg(mvp_sd, md->db->dropitem[i].nameid);
-				continue;
-			}
-
-			std::shared_ptr<s_item_drop> ditem = mob_setdropitem( md->db->dropitem[i], 1, md->mob_id );
-
-			//A Rare Drop Global Announce by Lupus
-			if( mvp_sd && md->db->dropitem[i].rate <= battle_config.rare_drop_announce ) {
-				char message[128];
-				sprintf (message, msg_txt(nullptr,541), mvp_sd->status.name, md->name, it->ename.c_str(), (float)drop_rate/100);
-				//MSG: "'%s' won %s's %s (chance: %0.02f%%)"
-				intif_broadcast(message,strlen(message)+1,BC_DEFAULT);
-			}
-			// Announce first, or else ditem will be freed. [Lance]
-			// By popular demand, use base drop rate for autoloot code. [Skotlex]
-			mob_item_drop(md, dlist, ditem, 0, battle_config.autoloot_adjust ? drop_rate : md->db->dropitem[i].rate, homkillonly || merckillonly);
-		}
 
 		// Ore Discovery [Celest]
 		if (sd == mvp_sd && pc_checkskill(sd,BS_FINDINGORE)>0 && battle_config.finding_ore_rate/10 >= rnd()%10000) {
@@ -2943,13 +2964,39 @@ int mob_dead(struct mob_data *md, struct block_list *src, int type)
 			}
 		}
 
-		// process items looted by the mob
-		if (md->lootitems) {
-			for (i = 0; i < md->lootitem_count; i++) {
-				std::shared_ptr<s_item_drop> ditem = mob_setlootitem(md->lootitems[i], md->mob_id);
+		// Regular mob drops drop after script-granted drops
+		for (i = 0; i < MAX_MOB_DROP_TOTAL; i++) {
+			if (md->db->dropitem[i].nameid == 0)
+				continue;
 
-				mob_item_drop( md, dlist, ditem, 1, 10000, homkillonly || merckillonly );
+			std::shared_ptr<item_data> it = item_db.find(md->db->dropitem[i].nameid);
+
+			if (it == nullptr)
+				continue;
+
+			drop_rate = mob_getdroprate(src, md->db, md->db->dropitem[i].rate, drop_modifier, md);
+
+			// attempt to drop the item
+			if (rnd() % 10000 >= drop_rate)
+				continue;
+
+			if (mvp_sd && it->type == IT_PETEGG) {
+				pet_create_egg(mvp_sd, md->db->dropitem[i].nameid);
+				continue;
 			}
+
+			std::shared_ptr<s_item_drop> ditem = mob_setdropitem(md->db->dropitem[i], 1, md->mob_id);
+
+			//A Rare Drop Global Announce by Lupus
+			if (mvp_sd && md->db->dropitem[i].rate <= battle_config.rare_drop_announce) {
+				char message[128];
+				sprintf(message, msg_txt(nullptr, 541), mvp_sd->status.name, md->name, it->ename.c_str(), (float)drop_rate / 100);
+				//MSG: "'%s' won %s's %s (chance: %0.02f%%)"
+				intif_broadcast(message, strlen(message) + 1, BC_DEFAULT);
+			}
+			// Announce first, or else ditem will be freed. [Lance]
+			// By popular demand, use base drop rate for autoloot code. [Skotlex]
+			mob_item_drop(md, dlist, ditem, 0, battle_config.autoloot_adjust ? drop_rate : md->db->dropitem[i].rate, homkillonly || merckillonly);
 		}
 
 		// Process map specific drops
@@ -2989,29 +3036,16 @@ int mob_dead(struct mob_data *md, struct block_list *src, int type)
 		}
 
 		// There are drop items.
-		if( !dlist->items.empty() ){
+		if (!dlist->items.empty() || !lootlist->items.empty()) {
 			mob_delayed_drops[md->bl.id] = dlist;
-
-			add_timer( tick + ( !battle_config.delay_battle_damage ? 500 : 0 ), mob_delay_item_drop, md->bl.id, 0 );
+			mob_looted_drops[md->bl.id] = lootlist;
+			add_timer(tick + (!battle_config.delay_battle_damage ? 500 : 0), mob_delay_item_drop, md->bl.id, 0);
 		}
-	} else if (md->lootitems && md->lootitem_count) {	//Loot MUST drop!
-		std::shared_ptr<s_item_drop_list> dlist = std::make_shared<s_item_drop_list>();
-
-		dlist->m = md->bl.m;
-		dlist->x = md->bl.x;
-		dlist->y = md->bl.y;
-		dlist->first_charid = (mvp_sd ? mvp_sd->status.char_id : 0);
-		dlist->second_charid = (second_sd ? second_sd->status.char_id : 0);
-		dlist->third_charid = (third_sd ? third_sd->status.char_id : 0);
-
-		for (i = 0; i < md->lootitem_count; i++) {
-			std::shared_ptr<s_item_drop> ditem = mob_setlootitem(md->lootitems[i], md->mob_id);
-
-			mob_item_drop( md, dlist, ditem, 1, 10000, homkillonly || merckillonly );
-		}
-
-		mob_delayed_drops[md->bl.id] = dlist;
-		add_timer( tick + ( !battle_config.delay_battle_damage ? 500 : 0 ), mob_delay_item_drop, md->bl.id, 0 );
+	}
+	// Loot MUST drop!
+	else if (!lootlist->items.empty()) {
+		mob_looted_drops[md->bl.id] = lootlist;
+		add_timer(tick + (!battle_config.delay_battle_damage ? 500 : 0), mob_delay_item_drop, md->bl.id, 0);
 	}
 
 	if( mvp_sd && md->get_bosstype() == BOSSTYPE_MVP ){
@@ -3114,7 +3148,7 @@ int mob_dead(struct mob_data *md, struct block_list *src, int type)
 
 				if((temp = pc_additem(mvp_sd,&item,1,LOG_TYPE_PICKDROP_PLAYER)) != 0) {
 					clif_additem(mvp_sd,0,0,temp);
-					map_addflooritem(&item,1,mvp_sd->bl.m,mvp_sd->bl.x,mvp_sd->bl.y,mvp_sd->status.char_id,(second_sd?second_sd->status.char_id:0),(third_sd?third_sd->status.char_id:0),1,0,true);
+					map_addflooritem(&item,1,mvp_sd->bl.m,mvp_sd->bl.x,mvp_sd->bl.y,mvp_sd->status.char_id,(second_sd?second_sd->status.char_id:0),(third_sd?third_sd->status.char_id:0),1,0,true,DIR_CENTER);
 				}
 
 				if (i_data->flag.broadcast)
@@ -3441,7 +3475,6 @@ int mob_class_change (struct mob_data *md, int mob_id)
 	status_set_viewdata(&md->bl, mob_id);
 	clif_mob_class_change(md,md->vd->class_);
 	status_calc_mob(md,SCO_FIRST);
-	md->ud.state.speed_changed = 1; //Speed change update.
 
 	if (battle_config.monster_class_change_recover) {
 		memset(md->dmglog, 0, sizeof(md->dmglog));
@@ -3644,12 +3677,12 @@ int mob_summonslave(struct mob_data *md2,int *value,int amount,uint16 skill_id)
 			md->status.hp = md->status.max_hp*hp_rate/100;
 
 		if (skill_id == NPC_SUMMONSLAVE) // Only appies to NPC_SUMMONSLAVE
-			status_calc_slave_mode(md, md2); // Inherit the aggressive mode of the master.
+			status_calc_slave_mode(*md); // Inherit the aggressive mode of the master.
 
 		if (md2->state.copy_master_mode)
 			md->status.mode = md2->status.mode;
 
-		clif_skill_nodamage(&md->bl,&md->bl,skill_id,amount,1);
+		clif_skill_nodamage(&md->bl,md->bl,skill_id,amount);
 	}
 
 	return 0;
@@ -5305,7 +5338,7 @@ static int mob_read_sqldb(void)
 	for( uint8 fi = 0; fi < ARRAYLENGTH(mob_db_name); ++fi ) {
 		// retrieve all rows from the mob database
 		if( SQL_ERROR == Sql_Query(mmysql_handle, "SELECT `id`,`name_aegis`,`name_english`,`name_japanese`,`level`,`hp`,`sp`,`base_exp`,`job_exp`,`mvp_exp`,`attack`,`attack2`,`defense`,`magic_defense`,`str`,`agi`,`vit`,`int`,`dex`,`luk`,`attack_range`,`skill_range`,`chase_range`,`size`,`race`,"
-			"`racegroup_goblin`,`racegroup_kobold`,`racegroup_orc`,`racegroup_golem`,`racegroup_guardian`,`racegroup_ninja`,`racegroup_gvg`,`racegroup_battlefield`,`racegroup_treasure`,`racegroup_biolab`,`racegroup_manuk`,`racegroup_splendide`,`racegroup_scaraba`,`racegroup_ogh_atk_def`,`racegroup_ogh_hidden`,`racegroup_bio5_swordman_thief`,`racegroup_bio5_acolyte_merchant`,`racegroup_bio5_mage_archer`,`racegroup_bio5_mvp`,`racegroup_clocktower`,`racegroup_thanatos`,`racegroup_faceworm`,`racegroup_hearthunter`,`racegroup_rockridge`,`racegroup_werner_lab`,`racegroup_temple_demon`,`racegroup_illusion_vampire`,`racegroup_malangdo`,`racegroup_ep172alpha`,`racegroup_ep172beta`,`racegroup_ep172bath`,`racegroup_illusion_turtle`,`racegroup_rachel_sanctuary`,`racegroup_illusion_luanda`,`racegroup_illusion_frozen`,`racegroup_illusion_moonlight`,"
+			"`racegroup_goblin`,`racegroup_kobold`,`racegroup_orc`,`racegroup_golem`,`racegroup_guardian`,`racegroup_ninja`,`racegroup_gvg`,`racegroup_battlefield`,`racegroup_treasure`,`racegroup_biolab`,`racegroup_manuk`,`racegroup_splendide`,`racegroup_scaraba`,`racegroup_ogh_atk_def`,`racegroup_ogh_hidden`,`racegroup_bio5_swordman_thief`,`racegroup_bio5_acolyte_merchant`,`racegroup_bio5_mage_archer`,`racegroup_bio5_mvp`,`racegroup_clocktower`,`racegroup_thanatos`,`racegroup_faceworm`,`racegroup_hearthunter`,`racegroup_rockridge`,`racegroup_werner_lab`,`racegroup_temple_demon`,`racegroup_illusion_vampire`,`racegroup_malangdo`,`racegroup_ep172alpha`,`racegroup_ep172beta`,`racegroup_ep172bath`,`racegroup_illusion_turtle`,`racegroup_rachel_sanctuary`,`racegroup_illusion_luanda`,`racegroup_illusion_frozen`,`racegroup_illusion_moonlight`,`racegroup_ep16_def`,"
 			"`element`,`element_level`,`walk_speed`,`attack_delay`,`attack_motion`,`damage_motion`,`damage_taken`,`ai`,`class`,"
 			"`mode_canmove`,`mode_looter`,`mode_aggressive`,`mode_assist`,`mode_castsensoridle`,`mode_norandomwalk`,`mode_nocast`,`mode_canattack`,`mode_castsensorchase`,`mode_changechase`,`mode_angry`,`mode_changetargetmelee`,`mode_changetargetchase`,`mode_targetweak`,`mode_randomtarget`,`mode_ignoremelee`,`mode_ignoremagic`,`mode_ignoreranged`,`mode_mvp`,`mode_ignoremisc`,`mode_knockbackimmune`,`mode_teleportblock`,`mode_fixeditemdrop`,`mode_detector`,`mode_statusimmune`,`mode_skillimmune`,"
 			"`mvpdrop1_item`,`mvpdrop1_rate`,`mvpdrop1_option`,`mvpdrop1_index`,`mvpdrop2_item`,`mvpdrop2_rate`,`mvpdrop2_option`,`mvpdrop2_index`,`mvpdrop3_item`,`mvpdrop3_rate`,`mvpdrop3_option`,`mvpdrop3_index`,"

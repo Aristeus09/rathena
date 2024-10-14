@@ -2825,6 +2825,53 @@ enum e_random_item_group {
 	IG_P_BOOSTER_CALL_PACKAGE,
 	IG_P_COMPENSATION_BOX,
 	IG_ENCHANT_STONE_BOX35,
+	IG_STOVE_CHANNELING_BOX_1,
+	IG_STOVE_CHANNELING_BOX_2,
+	IG_STOVE_CHANNELING_BOX_3,
+	IG_STOVE_CHANNELING_BOX_4,
+	IG_LI_NYANGVINE_BOX1_35,
+	IG_LI_NYANGVINE_BOX2_35,
+	IG_LI_NYANGVINE_BOX3_35,
+	IG_A_SPEED_BOOSTER_BOX,
+	IG_A_SPEED_BOOSTER_10_BOX,
+	IG_L_INFINITY_POWER_PACK,
+	IG_L_ALL_RED_PACK,
+	IG_L_DEFENSE_POTION_PACK,
+	IG_L_SPEED_FORCE_PACK,
+	IG_L_SPECIAL_SPEED_PACK,
+	IG_L_SPECIAL_FORCE_PACK,
+	IG_COSTUMEMILEPACK_35_1,
+	IG_COSTUMEMILEPACK_35_2,
+	IG_COSTUMEMILEPACK_35_3,
+	IG_2024ROS_BOX_1ST,
+	IG_2024ROS_BOX_2ND,
+	IG_2024ROS_BOX_3RD,
+	IG_2024ROS_BOX_4TH,
+	IG_2024ROS_BOX_5TH,
+	IG_AEGIS_103234,
+	IG_2024SPORTS_BOX,
+	IG_22TH_PRESENT_BOX,
+	IG_AEGIS_103316,
+	IG_SVIP_GIFT_22THANIV,
+	IG_VVIP_GIFT_22THANIV,
+	IG_VIP_GIFT_22THANIV,
+	IG_LI_NYANGVINE_BOX1_36,
+	IG_LI_NYANGVINE_BOX2_36,
+	IG_LI_NYANGVINE_BOX3_36,
+	IG_2024_SUMMER_PACK_1,
+	IG_2024_SUMMER_PACK_2,
+	IG_2024_SUMMER_PACK_3,
+	IG_2024_SUMMER_PACK_4,
+	IG_LI_A_HD_CARNIUMBOX,
+	IG_LI_A_HD_BRADIUMBOX,
+	IG_22TH_PACKAGE_1,
+	IG_22TH_PACKAGE_2,
+	IG_22TH_PACKAGE_3,
+	IG_22TH_PACKAGE_4,
+	IG_CLB_SS_NYANG_PACK,
+	IG_CLB_SS_REFINE1_PACK,
+	IG_CLB_SS_REFINE2_PACK,
+	IG_CLB_SS_EXP_PACK,
 
 	IG_MAX,
 };
@@ -3173,7 +3220,10 @@ public:
 	int16 item_exists_pc(map_session_data *sd, uint16 group_id);
 	t_itemid get_random_item_id(uint16 group_id, uint8 sub_group);
 	std::shared_ptr<s_item_group_entry> get_random_entry(uint16 group_id, uint8 sub_group);
-	uint8 pc_get_itemgroup(uint16 group_id, bool identify, map_session_data *sd);
+	uint8 pc_get_itemgroup( uint16 group_id, bool identify, map_session_data& sd );
+
+private:
+	void pc_get_itemgroup_sub( map_session_data& sd, bool identify, std::shared_ptr<s_item_group_entry> data );
 };
 
 extern ItemGroupDatabase itemdb_group;

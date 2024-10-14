@@ -714,7 +714,7 @@ int pet_attackskill(struct pet_data *pd, int target_id)
 
 		bl = map_id2bl(target_id);
 
-		if(bl == nullptr || pd->bl.m != bl->m || bl->prev == nullptr || status_isdead(bl) ||
+		if(bl == nullptr || pd->bl.m != bl->m || bl->prev == nullptr || status_isdead(*bl) ||
 			!check_distance_bl(&pd->bl, bl, pd->db->range3))
 			return 0;
 
@@ -1192,7 +1192,7 @@ int pet_select_egg(map_session_data *sd,short egg_index)
 	if(egg_index < 0 || egg_index >= MAX_INVENTORY)
 		return 0; //Forged packet!
 
-	if(sd->trade_partner)	//The player have trade in progress.
+	if(sd->state.trading)	//The player have trade in progress.
 		return 0;
 
 	std::shared_ptr<s_pet_db> pet = pet_db_search(sd->inventory.u.items_inventory[egg_index].nameid, PET_EGG);
@@ -1278,7 +1278,6 @@ int pet_catch_process2(map_session_data* sd, int target_id)
 	}
 
 	if(sd->catch_target_class != md->mob_id || !pet) {
-		clif_emotion(&md->bl, ET_ANGER);	//mob will do /ag if wrong lure is used on them.
 		clif_pet_roulette( *sd, false );
 		sd->catch_target_class = PET_CATCH_FAIL;
 
@@ -1288,6 +1287,14 @@ int pet_catch_process2(map_session_data* sd, int target_id)
 	if( battle_config.pet_distance_check && distance_bl( &sd->bl, &md->bl ) > battle_config.pet_distance_check ){
 		clif_pet_roulette( *sd, false );
 		sd->catch_target_class = PET_CATCH_FAIL;
+
+		return 1;
+	}
+
+	if (!pc_inventoryblank(sd)) {
+		clif_pet_roulette(*sd, false);
+		sd->catch_target_class = PET_CATCH_FAIL;
+		clif_msg_color(sd, MSI_CANT_GET_ITEM_BECAUSE_COUNT, color_table[COLOR_RED]);
 
 		return 1;
 	}
@@ -1376,8 +1383,10 @@ bool pet_get_egg(uint32 account_id, short pet_class, int pet_id ) {
 	tmp_item.card[3] |= pet_get_card3_intimacy( pet->intimate ); // Store intimacy status based on initial intimacy
 
 	if((ret = pc_additem(sd,&tmp_item,1,LOG_TYPE_PICKDROP_PLAYER))) {
-		clif_additem(sd,0,0,ret);
-		map_addflooritem(&tmp_item,1,sd->bl.m,sd->bl.x,sd->bl.y,0,0,0,0,0);
+		clif_additem(sd, 0, 0, ret);
+		intif_delete_petdata(pet_id);
+
+		return false;
 	}
 
 	return true;
@@ -1554,17 +1563,26 @@ static int pet_unequipitem(map_session_data *sd, struct pet_data *pd)
 		return 1;
 
 	t_itemid nameid = pd->pet.equip;
-	pd->pet.equip = 0;
-	status_set_viewdata(&pd->bl, pd->pet.class_);
-	clif_pet_equip_area(pd);
 	memset(&tmp_item,0,sizeof(tmp_item));
 	tmp_item.nameid = nameid;
 	tmp_item.identify = 1;
 
 	if((flag = pc_additem(sd,&tmp_item,1,LOG_TYPE_OTHER))) {
-		clif_additem(sd,0,0,flag);
-		map_addflooritem(&tmp_item,1,sd->bl.m,sd->bl.x,sd->bl.y,0,0,0,0,0);
+		clif_additem(sd, 0, 0, flag);
+
+		// On official servers the item is destroyed if you don't have enough space
+		if (battle_config.pet_unequip_destroy) {
+			log_pick_pc( sd, LOG_TYPE_OTHER, -1, &tmp_item );
+		}
+		// Don't unequip (and don't destroy) the item if failed to add it to the inventory
+		else {
+			return 1;
+		}
 	}
+
+	pd->pet.equip = 0;
+	status_set_viewdata(&pd->bl, pd->pet.class_);
+	clif_pet_equip_area(pd);
 
 	if( battle_config.pet_equip_required ) { // Skotlex: halt support timers if needed
 		if( pd->state.skillbonus ) {
@@ -1767,13 +1785,13 @@ static int pet_ai_sub_hard(struct pet_data *pd, map_session_data *sd, t_tick tic
 			return 0; // Wait until the pet finishes walking back to master.
 
 		pd->status.speed = pd->get_pet_walk_speed();
-		pd->ud.state.change_walk_target = pd->ud.state.speed_changed = 1;
+		pd->ud.state.change_walk_target = 1;
 	}
 
 	if (pd->target_id) {
 		target = map_id2bl(pd->target_id);
 
-		if (!target || pd->bl.m != target->m || status_isdead(target) ||
+		if (!target || pd->bl.m != target->m || status_isdead(*target) ||
 			!check_distance_bl(&pd->bl, target, pd->db->range3)) {
 			target = nullptr;
 			pet_unlocktarget(pd);
@@ -2055,7 +2073,7 @@ TIMER_FUNC(pet_recovery_timer){
 	if(sd->sc.getSCE(pd->recovery->type)) {
 		//Display a heal animation?
 		//Detoxify is chosen for now.
-		clif_skill_nodamage(&pd->bl,&sd->bl,TF_DETOXIFY,1,1);
+		clif_skill_nodamage(&pd->bl,sd->bl,TF_DETOXIFY,1);
 		status_change_end(&sd->bl, pd->recovery->type);
 		clif_emotion(&pd->bl, ET_OK);
 	}
@@ -2072,7 +2090,6 @@ TIMER_FUNC(pet_recovery_timer){
  */
 TIMER_FUNC(pet_heal_timer){
 	map_session_data *sd = map_id2sd(id);
-	struct status_data *status;
 	struct pet_data *pd;
 	unsigned int rate = 100;
 
@@ -2086,7 +2103,7 @@ TIMER_FUNC(pet_heal_timer){
 		return 0;
 	}
 
-	status = status_get_status_data(&sd->bl);
+	status_data* status = status_get_status_data(sd->bl);
 
 	if(pc_isdead(sd) ||
 		(rate = get_percentage(status->sp, status->max_sp)) > pd->s_skill->sp ||
@@ -2099,7 +2116,7 @@ TIMER_FUNC(pet_heal_timer){
 
 	pet_stop_attack(pd);
 	pet_stop_walking(pd,1);
-	clif_skill_nodamage(&pd->bl,&sd->bl,AL_HEAL,pd->s_skill->lv,1);
+	clif_skill_nodamage(&pd->bl,sd->bl,AL_HEAL,pd->s_skill->lv);
 	status_heal(&sd->bl, pd->s_skill->lv,0, 0);
 	pd->s_skill->timer = add_timer(tick+pd->s_skill->delay*1000,pet_heal_timer,sd->bl.id,0);
 	return 0;
@@ -2116,7 +2133,6 @@ TIMER_FUNC(pet_heal_timer){
 TIMER_FUNC(pet_skill_support_timer){
 	map_session_data *sd = map_id2sd(id);
 	struct pet_data *pd;
-	struct status_data *status;
 	short rate = 100;
 
 	if(sd == nullptr || sd->pd == nullptr || sd->pd->s_skill == nullptr)
@@ -2129,7 +2145,7 @@ TIMER_FUNC(pet_skill_support_timer){
 		return 0;
 	}
 
-	status = status_get_status_data(&sd->bl);
+	status_data* status = status_get_status_data(sd->bl);
 
 	if (DIFF_TICK(pd->ud.canact_tick, tick) > 0) {
 		//Wait until the pet can act again.
